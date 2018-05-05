@@ -1,1 +1,5 @@
-u-boot**
+uboot.env
+sd.boot
+sd.img
+test.bin
+

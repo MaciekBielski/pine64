@@ -6,78 +6,109 @@
 # u-boot first that will be combined with mainline u-boot and normal ATF.
 
 
-tools_dir		= sunxi-tools
-fel				= $(tools_dir)/sunxi-fel
-blobs			= ./blobs
-apritzel_repo	= https://github.com/apritzel/pine64/blob/master/binaries
 ub_dir			= u-boot
-# xcc				= /opt/gcc-linaro-6.3.1-2017.05-x86_64_aarch64-elf/bin/aarch64-elf-
 xcc	= /opt/gcc-linaro-7.2.1-2017.11-x86_64_aarch64-linux-gnu/bin/aarch64-linux-gnu-
 xcc32 = /opt/gcc-linaro-6.3.1-2017.02-x86_64_arm-eabi/bin/arm-eabi-
 
 ###############################################################################
 # 1)
-# sunxi-tools
+# ATF
 ###############################################################################
+atf_dir			= atf
+atf_bin			= $(atf_dir)/build/sun50iw1p1/debug/bl31.bin
 
-tools:
-	git clone https://github.com/linux-sunxi/$(tools_dir)
-	$(MAKE) -C $(tools_dir)
+# turned into submodule
+atf_clone:
+	git clone -b allwinner --single-branch \
+		 https://github.com/apritzel/arm-trusted-firmware.git $(atf_dir)
+
+atf_build:
+	$(MAKE) -C $(atf_dir) CROSS_COMPILE=$(xcc) PLAT=sun50iw1p1 DEBUG=1 bl31
 
 ###############################################################################
 # 2)
-# blobs
-###############################################################################
-
-blobs:
-	mkdir -p $(blobs)
-	cd $(blobs) && wget $(apritzel_repo)/bl31.bin
-	cd $(blobs) && wget $(apritzel_repo)/sunxi-a64-spl32-ddr3.bin
-
-###############################################################################
-# 3)
 # U-boot
+# $ make pine64_defconfig
+# change environment:
+#	default mmc (0:auto) to (1:auto)
+# $ make menuconfig
+#
+# rebuild
 ###############################################################################
-ubconfig = sun50i-a64-ddr3-spl_defconfig
-# ubconfig = pine64_plus_defconfig
+# ubconfig = sun50i-a64-ddr3-spl_defconfig
+ubconfig = pine64_plus_defconfig
 
-# git clone -b v2018.03 git://git.denx.de/u-boot.git $(ub_dir)
 # git clone https://github.com/linux-sunxi/u-boot-sunxi $(ub_dir)
+# git clone -b sunxi64-fel32 --single-branch git@github.com:apritzel/u-boot.git $(ub_dir)
+
 ubclone:
-	git clone -b sunxi64-fel32 --single-branch git@github.com:apritzel/u-boot.git $(ub_dir)
+	git clone git://git.denx.de/u-boot.git $(ub_dir)
+
+ubdefconf:
+	$(MAKE) -C $(ub_dir) BL31=$(PWD)/$(atf_bin) ARCH=arm CROSS_COMPILE=$(xcc) $(ubconfig)
+
+ubmenuconf:
+	$(MAKE) -C $(ub_dir) BL31=$(PWD)/$(atf_bin) ARCH=arm CROSS_COMPILE=$(xcc) menuconfig
 
 ubbuild:
-	$(MAKE) -C $(ub_dir) ARCH=arm CROSS_COMPILE=$(xcc32) $(ubconfig)
-	$(MAKE) -C $(ub_dir) ARCH=arm CROSS_COMPILE=$(xcc32) -j3
+	$(MAKE) -C $(ub_dir) BL31=$(PWD)/$(atf_bin) ARCH=arm CROSS_COMPILE=$(xcc) -j3
 
 ubclean:
 	$(MAKE) -C $(ub_dir) mrproper
 
 
+
 ###############################################################################
 # 4)
-# Cat spl and uboot
+# Putting all together on an SD card
+#
+# im_out is 32M large
+
+# Uboot.env does not work if generated from uboot.in, first call 'saveenv' in
+# the u-boot shell.
+# NO! Size was wrong, it has to be equal to the one specified in menuconf
+# 'Environment'
 ###############################################################################
-spl		= $(blobs)/sunxi-spl-mainline.bin
-itb		= $(blobs)/u-boot-mainline.itb
-ub_spl	= $(blobs)/uboot-with-spl.bin
-ub_bin	= $(ub_dir)/u-boot.bin
+ub_spl		= $(ub_dir)/u-boot-sunxi-with-spl.bin
+im_env		= sd.env
+im_part		= sd.boot
+im_out		= sd.img
+env_in		= uboot.in
+env_out		= uboot.env
+mkenv		= $(ub_dir)/tools/mkenvimage
+
+define PARTTAB
+cat <<@ | sudo fdisk $(im_out)
+o
+n
+p
+1
 
 
-splcat:
-	cat $(spl) $(itb) > $(ub_spl)
+t
+83
+p
+w
+@
+endef
+export PARTTAB
 
 
-###############################################################################
-# 5)
-# Boot
-###############################################################################
-atf				= $(blobs)/bl31.bin
+boot:
+	dd if=/dev/zero bs=1M count=16 of=$(im_out)
+	dd if=$(ub_spl) bs=8k seek=1 conv=notrunc of=$(im_out)
+	dd if=/dev/zero bs=1M count=8 of=$(im_part)
+	sh -c "$$PARTTAB"
+	sudo mkfs.vfat -n BOOT $(im_part)
+	$(ub_dir)/tools/mkenvimage -s 0x20000 -o $(env_out) $(env_in)
+	mcopy -smnv -i $(im_part) $(env_out) ::
+	dd if=$(im_part) bs=1M seek=1 conv=notrunc of=$(im_out)
 
-run:
-	./$(tools_dir)/sunxi-fel -v -p uboot $(ub_spl) write 0x44000 $(atf) \
-		write 0x4a000000 $(ub_bin)
 
-# Read more on FEL boot mode
-# $ sunxi-fel -v -p spl sunxi-a64-spl32-ddr3.bin write 0x44000 /path/to/arm-trusted-firmware/bl31.bin write 0x4a000000 /path/to/u-boot/u-boot.bin reset64 0x44000
+sd_clean:
+	rm -f $(im_part) $(im_out) $(im_env) $(env_out)
+
+flash:
+	dd if=$(im_out) of=/dev/mmcblk0 && sync
+
 
